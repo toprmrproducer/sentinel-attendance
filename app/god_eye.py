@@ -17,6 +17,7 @@ from ultralytics import YOLO
 from app import engine as face_engine
 from app import tracking
 from app import telephony
+from app import activity
 
 ALERT_CALL_NUMBER = os.environ.get("SENTINEL_ALERT_CALL_NUMBER")  # e.g. "919307512816", unset = disabled
 ALERT_CALL_COOLDOWN_SEC = 120
@@ -115,6 +116,8 @@ def process_frame(frame, source: str, identify_faces: bool = True):
                 zx1, zy1, zx2, zy2 = z["bbox"]
                 if zx1 <= cx <= zx2 and zy1 <= cy <= zy2:
                     tracking.record_zone_event(z["id"], int(tid), source)
+                    if identity:
+                        activity.maybe_log_zone_change(identity, source, z["label"])
 
             detections.append({
                 "track_id": int(tid),

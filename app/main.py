@@ -1,11 +1,14 @@
 import os
 import time
+import json
+from datetime import datetime
 import cv2
 from fastapi import FastAPI, UploadFile, File, Form, Request, Depends
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 
-from app import engine, attendance, tracking, live, review, payroll, telephony
+from fastapi.staticfiles import StaticFiles
+from app import engine, attendance, tracking, live, review, payroll, telephony, activity
 
 app = FastAPI(title="Sentinel Attendance POC")
 app.add_middleware(SessionMiddleware, secret_key="sentinel-poc-dev-secret-change-in-real-deploy")
@@ -63,11 +66,25 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
+FACES_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "faces")
+os.makedirs(FACES_DIR, exist_ok=True)
+app.mount("/static/faces", StaticFiles(directory=FACES_DIR), name="faces")
+
+DEFAULT_CAFE_ZONES = [
+    ("Espresso Station", 350, 80, 640, 280),
+    ("Register", 0, 100, 180, 280),
+    ("Prep Counter", 150, 100, 400, 220),
+]
+
+
 @app.on_event("startup")
 def _boot_godseye_feed():
     live.start_source(GODSEYE_SOURCE, LONG_FEED_VIDEO, loop=True, sample_every=3)
     if os.path.exists(CAFE_VIDEO):
         live.start_source(CAFE_SOURCE, CAFE_VIDEO, loop=True, sample_every=3)
+    if not tracking.list_zones(CAFE_SOURCE):
+        for label, x1, y1, x2, y2 in DEFAULT_CAFE_ZONES:
+            tracking.create_zone(CAFE_SOURCE, label, x1, y1, x2, y2)
 
 
 @app.post("/api/enroll")
@@ -240,6 +257,112 @@ def api_test_alert(request: Request):
     return telephony.trigger_alert_call(number, "This is a test of the Sentinel theft-aversion auto-dial.")
 
 
+@app.get("/api/activity/{source}")
+def api_activity(source: str, name: str = None):
+    return activity.recent_activity(name=name, source=source, limit=40)
+
+
+@app.get("/api/profile/{name}")
+def api_profile(name: str, source: str = CAFE_SOURCE):
+    sightings = attendance.sightings_for(name)
+    summary = review.build_person_summary(name, sightings)
+    wage = payroll.wage_summary(name, summary["per_day"]) if summary else {
+        "hourly_wage": payroll.get_wage(name), "total_hours": 0, "estimated_pay": 0, "days_counted": 0}
+    recent = activity.recent_activity(name=name, source=source, limit=10)
+    current_zone = recent[0]["event"].replace("moved to ", "") if recent else "not currently visible"
+    has_photo = os.path.exists(os.path.join(FACES_DIR, f"{name}.jpg"))
+    return {
+        "name": name,
+        "photo_url": f"/static/faces/{name}.jpg" if has_photo else None,
+        "current_zone": current_zone,
+        "recent_activity": recent,
+        "payroll": wage,
+    }
+
+
+@app.post("/api/narrate/{name}")
+def api_narrate(name: str, source: str = CAFE_SOURCE):
+    recent = activity.recent_activity(name=name, source=source, limit=15)
+    if not recent:
+        return {"ok": False, "error": f"no logged activity for {name} yet on {source}"}
+    events_text = "\n".join(f"{r['ts']}: {r['event']}" for r in reversed(recent))
+    prompt = (
+        f"Here is a REAL, already-logged sequence of zone-movement events for an employee "
+        f"named {name} at a cafe. Do not invent any event not listed. Write a short, natural, "
+        f"punchy 2-3 sentence narration of what she's been doing, like a manager glancing at "
+        f"a camera feed would describe it out loud. No corporate tone, just plain observation.\n\n"
+        f"EVENTS:\n{events_text}"
+    )
+    import subprocess
+    result = subprocess.run([review.AR_CLI, "ask", prompt], capture_output=True, text=True, timeout=75)
+    if result.returncode != 0:
+        return {"ok": False, "error": result.stderr.strip()}
+    lines = result.stdout.strip().split("\n")
+    note = "\n".join(lines[1:] if lines and lines[0].startswith("[") else lines).strip()
+    return {"ok": True, "narration": note}
+
+
+@app.post("/api/ask")
+async def api_ask(request: Request):
+    body = await request.json()
+    question = body.get("question", "")
+    if not question:
+        return {"ok": False, "error": "no question provided"}
+
+    identities = attendance.all_identities()
+    context_rows = []
+    for name in identities:
+        sightings = attendance.sightings_for(name)
+        summary = review.build_person_summary(name, sightings)
+        if summary:
+            wage = payroll.wage_summary(name, summary["per_day"])
+            recent = activity.recent_activity(name=name, limit=5)
+            context_rows.append({
+                "name": name, "days_present": summary["total_days_present"],
+                "avg_daily_span_minutes": summary["avg_daily_span_minutes"],
+                "total_hours": wage["total_hours"], "estimated_pay": wage["estimated_pay"],
+                "recent_activity": [r["event"] for r in recent],
+            })
+
+    if not context_rows:
+        return {"ok": False, "error": "no enrolled identity has any logged sightings yet"}
+
+    prompt = (
+        f"You are answering a question about REAL, already-computed employee attendance/activity "
+        f"data. Do not invent numbers not present in the data. If the data can't answer the "
+        f"question, say so plainly.\n\nDATA:\n{json.dumps(context_rows, indent=2)}\n\n"
+        f"QUESTION: {question}\n\nAnswer in 2-4 plain sentences."
+    )
+    import subprocess
+    result = subprocess.run([review.AR_CLI, "ask", prompt], capture_output=True, text=True, timeout=75)
+    if result.returncode != 0:
+        return {"ok": False, "error": result.stderr.strip()}
+    lines = result.stdout.strip().split("\n")
+    answer = "\n".join(lines[1:] if lines and lines[0].startswith("[") else lines).strip()
+    return {"ok": True, "answer": answer, "context": context_rows}
+
+
+@app.get("/api/theft-risk/{source}")
+def api_theft_risk(source: str):
+    anomalies = tracking.recent_anomalies(source, limit=500)
+    now = datetime.now()
+    recent_count = 0
+    for a in anomalies:
+        try:
+            ts = datetime.fromisoformat(a["ts"])
+            if (now - ts).total_seconds() < 300:
+                recent_count += 1
+        except Exception:
+            continue
+    if recent_count == 0:
+        level, label = 0, "LOW"
+    elif recent_count <= 3:
+        level, label = 1, "MEDIUM"
+    else:
+        level, label = 2, "HIGH"
+    return {"level": level, "label": label, "recent_anomaly_count_5min": recent_count}
+
+
 @app.get("/godseye", response_class=HTMLResponse)
 def godseye(request: Request, source: str = GODSEYE_SOURCE):
     if not require_login(request):
@@ -255,6 +378,18 @@ header{{display:flex;justify-content:space-between;align-items:center;padding:14
 border-bottom:1px solid #1c1e22;background:#0b0d10}}
 header h1{{font-size:16px;margin:0;letter-spacing:.3px}}
 header a{{color:#7aa2f7;text-decoration:none;font-size:12px}}
+.risk-banner{{display:flex;align-items:center;gap:22px;padding:14px 22px;background:linear-gradient(90deg,#0b0d10,#111420);
+border-bottom:1px solid #1c1e22}}
+.risk-dot{{width:14px;height:14px;border-radius:50%;flex-shrink:0}}
+.risk-dot.low{{background:#3fd17a;box-shadow:0 0 0 0 rgba(63,209,122,.6);animation:pulse-low 2s infinite}}
+.risk-dot.medium{{background:#ffb020;box-shadow:0 0 0 0 rgba(255,176,32,.6);animation:pulse-med 1.4s infinite}}
+.risk-dot.high{{background:#ff4d4d;box-shadow:0 0 0 0 rgba(255,77,77,.6);animation:pulse-high 0.8s infinite}}
+@keyframes pulse-low {{0%{{box-shadow:0 0 0 0 rgba(63,209,122,.55)}}70%{{box-shadow:0 0 0 12px rgba(63,209,122,0)}}100%{{box-shadow:0 0 0 0 rgba(63,209,122,0)}}}}
+@keyframes pulse-med {{0%{{box-shadow:0 0 0 0 rgba(255,176,32,.55)}}70%{{box-shadow:0 0 0 14px rgba(255,176,32,0)}}100%{{box-shadow:0 0 0 0 rgba(255,176,32,0)}}}}
+@keyframes pulse-high {{0%{{box-shadow:0 0 0 0 rgba(255,77,77,.6)}}70%{{box-shadow:0 0 0 18px rgba(255,77,77,0)}}100%{{box-shadow:0 0 0 0 rgba(255,77,77,0)}}}}
+.risk-label{{font-size:14px;font-weight:700;letter-spacing:.5px}}
+.risk-label.low{{color:#3fd17a}} .risk-label.medium{{color:#ffb020}} .risk-label.high{{color:#ff4d4d}}
+.risk-sub{{color:#777;font-size:11.5px}}
 .layout{{display:grid;grid-template-columns:1fr 320px;gap:0;height:calc(100vh - 51px)}}
 .stage-wrap{{position:relative;padding:16px;overflow:auto}}
 .stage{{position:relative;display:inline-block;border:1px solid #1c1e22;border-radius:8px;overflow:hidden}}
@@ -289,6 +424,11 @@ select{{width:100%;background:#1e1e1e;color:#eee;border:1px solid #2c2c2c;border
 <a href="/godseye?source={CAFE_SOURCE}">Cafe feed</a>&nbsp;&nbsp;
 <a href="/dashboard">Attendance dashboard</a>&nbsp;&nbsp;<a href="/logout">Log out</a>
 </header>
+<div class="risk-banner">
+  <div class="risk-dot low" id="risk-dot"></div>
+  <div><span class="risk-label low" id="risk-label">THEFT RISK: LOW</span><br>
+  <span class="risk-sub" id="risk-sub">no anomalies in the last 5 minutes</span></div>
+</div>
 <div class="layout">
   <div class="stage-wrap">
     <div class="stage" id="stage">
@@ -302,8 +442,21 @@ select{{width:100%;background:#1e1e1e;color:#eee;border:1px solid #2c2c2c;border
     <h2>Selected</h2>
     <div class="panel" id="selected-panel">Click any box on the feed.</div>
 
-    <h2>Ask the model &mdash; review packet</h2>
+    <h2>Employee profile</h2>
     <select id="identity-select"><option value="">Pick an enrolled identity&hellip;</option></select>
+    <div id="profile-card"></div>
+
+    <h2>Live activity <span class="hint" style="text-transform:none">(real, logged, not invented)</span></h2>
+    <div id="activity-feed"></div>
+    <button class="btn secondary" onclick="narrate()">Narrate recent activity (Opus 4.8)</button>
+    <div id="narration-out"></div>
+
+    <h2>Ask the agent</h2>
+    <input id="ask-input" placeholder="e.g. who's the most active?" style="width:100%;background:#1e1e1e;color:#eee;border:1px solid #2c2c2c;border-radius:6px;padding:8px;box-sizing:border-box;margin-bottom:6px">
+    <button class="btn" onclick="askAgent()">Ask (Opus 4.8)</button>
+    <div id="ask-out"></div>
+
+    <h2>Ask the model &mdash; review packet</h2>
     <button class="btn" onclick="runReview()">Generate review (Opus 4.8)</button>
     <div id="review-out"></div>
 
@@ -415,8 +568,61 @@ async function loadIdentities() {{
   const sel = document.getElementById('identity-select');
   sel.innerHTML = '<option value="">Pick an enrolled identity&hellip;</option>' +
     ids.map(n => `<option value="${{n}}">${{n}}</option>`).join('');
-  sel.onchange = loadPayroll;
-  loadPayroll();
+  sel.onchange = () => {{ loadPayroll(); loadProfile(); loadActivityFeed(); }};
+  loadPayroll(); loadProfile(); loadActivityFeed();
+}}
+
+async function loadProfile() {{
+  const name = document.getElementById('identity-select').value;
+  const box = document.getElementById('profile-card');
+  if (!name) {{ box.innerHTML = ''; return; }}
+  const p = await (await fetch(`/api/profile/${{encodeURIComponent(name)}}?source=${{SOURCE}}`)).json();
+  box.innerHTML = `<div class="panel" style="display:flex;gap:10px;align-items:flex-start">
+    ${{p.photo_url ? `<img src="${{p.photo_url}}" style="width:56px;height:56px;object-fit:cover;border-radius:8px;border:1px solid #333">` : '<div style="width:56px;height:56px;border-radius:8px;background:#222"></div>'}}
+    <div>
+      <b>${{p.name}}</b><br>
+      <span class="k">Current zone:</span> ${{p.current_zone}}<br>
+      <span class="k">Hours logged:</span> ${{p.payroll.total_hours}} &middot; <span class="k">Est. pay:</span> $${{p.payroll.estimated_pay}}
+    </div>
+  </div>`;
+}}
+
+async function loadActivityFeed() {{
+  const name = document.getElementById('identity-select').value;
+  const url = name ? `/api/activity/${{SOURCE}}?name=${{encodeURIComponent(name)}}` : `/api/activity/${{SOURCE}}`;
+  const rows = await (await fetch(url)).json();
+  const box = document.getElementById('activity-feed');
+  box.innerHTML = rows.length ? rows.slice(0,12).map(r =>
+    `<div class="panel" style="padding:6px 10px"><b>${{r.name}}</b> ${{r.event}} <span class="k">&mdash; ${{r.ts.replace('T',' ').split('.')[0]}}</span></div>`
+  ).join('') : '<div class="hint">No zone activity logged yet for this feed.</div>';
+}}
+
+async function narrate() {{
+  const name = document.getElementById('identity-select').value;
+  const out = document.getElementById('narration-out');
+  if (!name) {{ out.innerHTML = '<p class="hint">Pick someone above first.</p>'; return; }}
+  out.innerHTML = '<p class="hint">Watching the tape&hellip;</p>';
+  const res = await (await fetch(`/api/narrate/${{encodeURIComponent(name)}}?source=${{SOURCE}}`, {{method:'POST'}})).json();
+  out.innerHTML = res.ok ? `<div class="review-note">${{res.narration}}</div>` : `<p class="hint">${{res.error}}</p>`;
+}}
+
+async function askAgent() {{
+  const q = document.getElementById('ask-input').value;
+  const out = document.getElementById('ask-out');
+  if (!q) return;
+  out.innerHTML = '<p class="hint">Thinking&hellip;</p>';
+  const res = await (await fetch('/api/ask', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{question:q}})}})).json();
+  out.innerHTML = res.ok ? `<div class="review-note">${{res.answer}}</div>` : `<p class="hint">${{res.error}}</p>`;
+}}
+
+async function loadTheftRisk() {{
+  const r = await (await fetch(`/api/theft-risk/${{SOURCE}}`)).json();
+  const cls = r.label.toLowerCase();
+  document.getElementById('risk-dot').className = 'risk-dot ' + cls;
+  document.getElementById('risk-label').className = 'risk-label ' + cls;
+  document.getElementById('risk-label').textContent = `THEFT RISK: ${{r.label}}`;
+  document.getElementById('risk-sub').textContent = r.recent_anomaly_count_5min === 0
+    ? 'no anomalies in the last 5 minutes' : `${{r.recent_anomaly_count_5min}} anomaly event(s) in the last 5 minutes`;
 }}
 
 async function loadPayroll() {{
@@ -504,10 +710,13 @@ loadAlerts();
 loadIdentities();
 loadThroughput();
 loadCashCollected();
+loadTheftRisk();
 setInterval(loadZoneStats, 4000);
 setInterval(loadAlerts, 4000);
 setInterval(loadThroughput, 5000);
 setInterval(loadCashCollected, 5000);
+setInterval(loadTheftRisk, 6000);
+setInterval(loadActivityFeed, 5000);
 </script>
 </body></html>
 """

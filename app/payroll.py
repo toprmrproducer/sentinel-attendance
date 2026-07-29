@@ -11,7 +11,7 @@ from datetime import date
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "payroll_config.json")
 DEFAULT_HOURLY_WAGE = 15.0
-DEFAULT_PRICE_PER_CUP = 100.0
+DEFAULT_PRICE_PER_CUP = 30.0
 
 
 def _load():

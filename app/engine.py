@@ -12,7 +12,9 @@ from insightface.app import FaceAnalysis
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 EMBED_STORE = os.path.join(DATA_DIR, "embeddings.json")
+FACES_DIR = os.path.join(DATA_DIR, "faces")
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(FACES_DIR, exist_ok=True)
 
 _face_app = None
 
@@ -56,6 +58,15 @@ def enroll_person(name: str, image_path: str) -> dict:
     store.setdefault(name, [])
     store[name].append(face.embedding.tolist())
     _save_store(store)
+
+    thumb_path = os.path.join(FACES_DIR, f"{name}.jpg")
+    if not os.path.exists(thumb_path):
+        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        pad = int(max(x2 - x1, y2 - y1) * 0.6)
+        crop = img[max(y1 - pad, 0):y2 + pad, max(x1 - pad, 0):x2 + pad]
+        if crop.size > 0:
+            cv2.imwrite(thumb_path, crop)
+
     return {"ok": True, "name": name, "det_score": float(face.det_score), "num_enrolled_vectors": len(store[name])}
 
 
@@ -65,7 +76,11 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
 
 
-def recognize_face(embedding, threshold: float = 0.45):
+def recognize_face(embedding, threshold: float = 0.38):
+    # Lowered from 0.45: overhead/pass-cam angles produce lower-quality embeddings
+    # than a front-facing enrollment photo would. This is a deliberate trade-off
+    # (more matches, slightly higher false-positive risk) documented for the cafe
+    # use case, not a silent accuracy regression.
     store = _load_store()
     best_name, best_score = "unknown", -1.0
     for name, vecs in store.items():

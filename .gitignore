@@ -4,5 +4,6 @@ __pycache__/
 yolov8n.pt
 data/*.db
 data/*.json
+data/faces/
 sample_footage/
 .DS_Store

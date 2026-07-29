@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+yolov8n.pt
+data/*.db
+data/*.json
+sample_footage/
+.DS_Store

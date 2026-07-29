@@ -342,6 +342,42 @@ async def api_ask(request: Request):
     return {"ok": True, "answer": answer, "context": context_rows}
 
 
+@app.get("/api/roster/{source}")
+def api_roster(source: str):
+    identities = attendance.all_identities()
+    all_names = set(identities)
+    embed_store_path = os.path.join(os.path.dirname(__file__), "..", "data", "embeddings.json")
+    if os.path.exists(embed_store_path):
+        with open(embed_store_path) as f:
+            all_names |= set(json.load(f).keys())
+
+    out = []
+    now = datetime.now()
+    for name in sorted(all_names):
+        sightings = attendance.sightings_for(name)
+        summary = review.build_person_summary(name, sightings)
+        wage = payroll.wage_summary(name, summary["per_day"]) if summary else {
+            "hourly_wage": payroll.get_wage(name), "total_hours": 0, "estimated_pay": 0}
+        recent = activity.recent_activity(name=name, source=source, limit=1)
+        current_zone, is_active = "not currently visible", False
+        if recent:
+            current_zone = recent[0]["event"].replace("moved to ", "")
+            try:
+                is_active = (now - datetime.fromisoformat(recent[0]["ts"])).total_seconds() < 90
+            except Exception:
+                pass
+        has_photo = os.path.exists(os.path.join(FACES_DIR, f"{name}.jpg"))
+        out.append({
+            "name": name,
+            "photo_url": f"/static/faces/{name}.jpg" if has_photo else None,
+            "current_zone": current_zone,
+            "is_active": is_active,
+            "hours_today": wage["total_hours"],
+            "estimated_pay": wage["estimated_pay"],
+        })
+    return out
+
+
 @app.get("/api/theft-risk/{source}")
 def api_theft_risk(source: str):
     anomalies = tracking.recent_anomalies(source, limit=500)
@@ -373,61 +409,109 @@ def godseye(request: Request, source: str = GODSEYE_SOURCE):
 <html><head><title>Sentinel &mdash; God's Eye</title>
 <style>
 *{{box-sizing:border-box}}
-body{{font-family:-apple-system,sans-serif;background:#07080a;color:#e8e8e8;margin:0}}
-header{{display:flex;justify-content:space-between;align-items:center;padding:14px 22px;
-border-bottom:1px solid #1c1e22;background:#0b0d10}}
-header h1{{font-size:16px;margin:0;letter-spacing:.3px}}
-header a{{color:#7aa2f7;text-decoration:none;font-size:12px}}
-.risk-banner{{display:flex;align-items:center;gap:22px;padding:14px 22px;background:linear-gradient(90deg,#0b0d10,#111420);
-border-bottom:1px solid #1c1e22}}
-.risk-dot{{width:14px;height:14px;border-radius:50%;flex-shrink:0}}
-.risk-dot.low{{background:#3fd17a;box-shadow:0 0 0 0 rgba(63,209,122,.6);animation:pulse-low 2s infinite}}
-.risk-dot.medium{{background:#ffb020;box-shadow:0 0 0 0 rgba(255,176,32,.6);animation:pulse-med 1.4s infinite}}
-.risk-dot.high{{background:#ff4d4d;box-shadow:0 0 0 0 rgba(255,77,77,.6);animation:pulse-high 0.8s infinite}}
-@keyframes pulse-low {{0%{{box-shadow:0 0 0 0 rgba(63,209,122,.55)}}70%{{box-shadow:0 0 0 12px rgba(63,209,122,0)}}100%{{box-shadow:0 0 0 0 rgba(63,209,122,0)}}}}
-@keyframes pulse-med {{0%{{box-shadow:0 0 0 0 rgba(255,176,32,.55)}}70%{{box-shadow:0 0 0 14px rgba(255,176,32,0)}}100%{{box-shadow:0 0 0 0 rgba(255,176,32,0)}}}}
-@keyframes pulse-high {{0%{{box-shadow:0 0 0 0 rgba(255,77,77,.6)}}70%{{box-shadow:0 0 0 18px rgba(255,77,77,0)}}100%{{box-shadow:0 0 0 0 rgba(255,77,77,0)}}}}
-.risk-label{{font-size:14px;font-weight:700;letter-spacing:.5px}}
-.risk-label.low{{color:#3fd17a}} .risk-label.medium{{color:#ffb020}} .risk-label.high{{color:#ff4d4d}}
-.risk-sub{{color:#777;font-size:11.5px}}
-.layout{{display:grid;grid-template-columns:1fr 320px;gap:0;height:calc(100vh - 51px)}}
-.stage-wrap{{position:relative;padding:16px;overflow:auto}}
-.stage{{position:relative;display:inline-block;border:1px solid #1c1e22;border-radius:8px;overflow:hidden}}
-.stage img{{display:block;max-width:100%}}
-.box{{position:absolute;border:2px solid #3fa7ff;border-radius:3px;cursor:pointer;
+:root{{--accent:#ff6a3d;--accent2:#39d3ff;--bg:#07070a;--panel:rgba(255,255,255,.035);
+--panel-brd:rgba(255,255,255,.08);--ink:#f1f1f3;--ink-dim:#9a9ea8;--good:#3fd17a;--warn:#ffb020;--bad:#ff4d4d}}
+body{{font-family:'Segoe UI',-apple-system,sans-serif;background:
+radial-gradient(1200px 600px at 15% -10%, rgba(255,106,61,.08), transparent 60%),
+radial-gradient(1000px 700px at 100% 0%, rgba(57,211,255,.06), transparent 55%),
+var(--bg);color:var(--ink);margin:0;letter-spacing:.1px}}
+header{{display:flex;justify-content:space-between;align-items:center;padding:16px 26px;
+border-bottom:1px solid var(--panel-brd);background:rgba(10,10,13,.7);backdrop-filter:blur(10px);
+position:sticky;top:0;z-index:20}}
+header h1{{font-size:17px;margin:0;letter-spacing:.4px;font-weight:800}}
+header h1 .glow{{color:var(--accent);text-shadow:0 0 18px rgba(255,106,61,.55)}}
+header nav a{{color:var(--ink-dim);text-decoration:none;font-size:12.5px;margin-left:20px;font-weight:600;
+transition:color .15s}}
+header nav a:hover{{color:var(--ink)}}
+header nav a.active{{color:var(--accent)}}
+
+.risk-banner{{display:flex;align-items:center;gap:20px;padding:16px 26px;
+background:linear-gradient(90deg,rgba(10,10,13,.9),rgba(18,14,12,.6));
+border-bottom:1px solid var(--panel-brd)}}
+.risk-dot{{width:16px;height:16px;border-radius:50%;flex-shrink:0}}
+.risk-dot.low{{background:var(--good);box-shadow:0 0 0 0 rgba(63,209,122,.6);animation:pulse-low 2s infinite}}
+.risk-dot.medium{{background:var(--warn);box-shadow:0 0 0 0 rgba(255,176,32,.6);animation:pulse-med 1.4s infinite}}
+.risk-dot.high{{background:var(--bad);box-shadow:0 0 0 0 rgba(255,77,77,.6);animation:pulse-high 0.8s infinite}}
+@keyframes pulse-low {{0%{{box-shadow:0 0 0 0 rgba(63,209,122,.55)}}70%{{box-shadow:0 0 0 14px rgba(63,209,122,0)}}100%{{box-shadow:0 0 0 0 rgba(63,209,122,0)}}}}
+@keyframes pulse-med {{0%{{box-shadow:0 0 0 0 rgba(255,176,32,.55)}}70%{{box-shadow:0 0 0 16px rgba(255,176,32,0)}}100%{{box-shadow:0 0 0 0 rgba(255,176,32,0)}}}}
+@keyframes pulse-high {{0%{{box-shadow:0 0 0 0 rgba(255,77,77,.6)}}70%{{box-shadow:0 0 0 20px rgba(255,77,77,0)}}100%{{box-shadow:0 0 0 0 rgba(255,77,77,0)}}}}
+.risk-label{{font-size:16px;font-weight:800;letter-spacing:.6px}}
+.risk-label.low{{color:var(--good)}} .risk-label.medium{{color:var(--warn)}} .risk-label.high{{color:var(--bad)}}
+.risk-sub{{color:var(--ink-dim);font-size:12px;margin-top:1px}}
+
+.roster-wrap{{padding:18px 26px 6px;border-bottom:1px solid var(--panel-brd)}}
+.roster-title{{font-size:11.5px;text-transform:uppercase;letter-spacing:1.2px;color:var(--ink-dim);
+font-weight:700;margin-bottom:10px}}
+.roster{{display:flex;gap:14px;overflow-x:auto;padding-bottom:14px}}
+.emp-card{{flex:0 0 200px;background:var(--panel);border:1px solid var(--panel-brd);border-radius:14px;
+padding:14px;display:flex;gap:12px;align-items:center;backdrop-filter:blur(6px);
+transition:transform .15s, border-color .15s;cursor:pointer}}
+.emp-card:hover{{transform:translateY(-2px);border-color:rgba(255,106,61,.4)}}
+.emp-photo{{width:52px;height:52px;border-radius:12px;object-fit:cover;flex-shrink:0;
+border:2px solid rgba(255,255,255,.12)}}
+.emp-photo.placeholder{{background:linear-gradient(135deg,#2a2a30,#1a1a1e);display:flex;align-items:center;
+justify-content:center;font-size:18px;font-weight:800;color:var(--ink-dim)}}
+.emp-info{{min-width:0}}
+.emp-name{{font-weight:800;font-size:13.5px;display:flex;align-items:center;gap:6px}}
+.live-dot{{width:8px;height:8px;border-radius:50%;background:#333;flex-shrink:0}}
+.live-dot.on{{background:var(--good);box-shadow:0 0 8px rgba(63,209,122,.8);animation:pulse-low 1.6s infinite}}
+.emp-zone{{font-size:11px;color:var(--accent2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.emp-meta{{font-size:10.5px;color:var(--ink-dim);margin-top:2px}}
+.roster-empty{{color:var(--ink-dim);font-size:12px;padding:10px 0}}
+
+.layout{{display:grid;grid-template-columns:1fr 360px;gap:0;height:calc(100vh - 51px - 68px - 108px)}}
+.stage-wrap{{position:relative;padding:22px;overflow:auto;display:flex;flex-direction:column;align-items:center}}
+.stage{{position:relative;width:100%;max-width:1100px;border:1px solid var(--panel-brd);border-radius:16px;
+overflow:hidden;box-shadow:0 30px 80px -20px rgba(0,0,0,.7), 0 0 0 1px rgba(255,255,255,.02);
+background:#000}}
+.stage img{{display:block;width:100%;height:auto}}
+.stage::after{{content:'';position:absolute;inset:0;pointer-events:none;border-radius:16px;
+box-shadow:inset 0 0 60px rgba(0,0,0,.5)}}
+.box{{position:absolute;border:2px solid var(--accent2);border-radius:4px;cursor:pointer;
 transition:box-shadow .1s;pointer-events:auto}}
-.box:hover{{box-shadow:0 0 0 2px #ffffff55;background:#3fa7ff22}}
-.box.person{{border-color:#3fd17a}}
-.box .tag{{position:absolute;top:-20px;left:-2px;background:#111;padding:1px 6px;font-size:11px;
-border-radius:4px;white-space:nowrap;border:1px solid #2a2a2a}}
-.zone{{position:absolute;border:2px dashed #ffb020;background:#ffb02015;pointer-events:none}}
-.zone .tag{{position:absolute;top:-18px;left:0;background:#3a2900;color:#ffb020;padding:1px 6px;
-font-size:10px;border-radius:4px}}
-.side{{border-left:1px solid #1c1e22;background:#0b0d10;overflow-y:auto;padding:16px}}
-.side h2{{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:#8a8f98;margin:18px 0 8px}}
+.box:hover{{box-shadow:0 0 0 3px rgba(255,255,255,.35);background:rgba(57,211,255,.15)}}
+.box.person{{border-color:var(--good)}}
+.box .tag{{position:absolute;top:-22px;left:-2px;background:rgba(10,10,13,.9);padding:2px 7px;font-size:11.5px;
+font-weight:700;border-radius:5px;white-space:nowrap;border:1px solid rgba(255,255,255,.12)}}
+.zone{{position:absolute;border:2px dashed var(--warn);background:rgba(255,176,32,.08);pointer-events:none;border-radius:4px}}
+.zone .tag{{position:absolute;top:-19px;left:0;background:#3a2900;color:var(--warn);padding:2px 7px;
+font-size:10.5px;font-weight:700;border-radius:5px}}
+.hint{{color:var(--ink-dim);font-size:11.5px;margin-top:10px;max-width:1100px;text-align:center}}
+
+.side{{border-left:1px solid var(--panel-brd);background:rgba(10,10,13,.5);overflow-y:auto;padding:20px}}
+.side h2{{font-size:11.5px;text-transform:uppercase;letter-spacing:1px;color:var(--ink-dim);
+margin:22px 0 10px;font-weight:700}}
 .side h2:first-child{{margin-top:0}}
-.panel{{background:#111318;border:1px solid #1c1e22;border-radius:8px;padding:12px;font-size:12.5px;
-margin-bottom:10px}}
-.panel .k{{color:#8a8f98}}
-.alert{{border-left:3px solid #ff5555;padding:6px 8px;margin-bottom:6px;font-size:11.5px;background:#160e0e;border-radius:4px}}
-.alert.lighting_drop{{border-color:#ffcc00}}
-.btn{{background:#2f6feb;border:none;color:#fff;padding:7px 12px;border-radius:6px;font-size:12px;
-cursor:pointer;margin-top:8px}}
-.btn.secondary{{background:#22252b}}
-select{{width:100%;background:#1e1e1e;color:#eee;border:1px solid #2c2c2c;border-radius:6px;padding:6px;margin-bottom:6px}}
-.hint{{color:#666;font-size:11px;margin-top:4px}}
-.review-note{{white-space:pre-wrap;font-size:12px;line-height:1.5;margin-top:8px;color:#cfd3da}}
+.panel{{background:var(--panel);border:1px solid var(--panel-brd);border-radius:12px;padding:14px;
+font-size:13px;margin-bottom:10px;backdrop-filter:blur(6px)}}
+.panel .k{{color:var(--ink-dim)}}
+.alert{{border-left:3px solid var(--bad);padding:8px 10px;margin-bottom:6px;font-size:12px;
+background:rgba(255,77,77,.06);border-radius:6px}}
+.alert.lighting_drop{{border-color:var(--warn);background:rgba(255,176,32,.06)}}
+.btn{{background:linear-gradient(135deg,var(--accent),#ff8a5c);border:none;color:#0a0a0a;padding:9px 14px;
+border-radius:8px;font-size:12.5px;font-weight:700;cursor:pointer;margin-top:8px}}
+.btn.secondary{{background:rgba(255,255,255,.08);color:var(--ink)}}
+select,input{{width:100%;background:rgba(255,255,255,.05);color:var(--ink);border:1px solid var(--panel-brd);
+border-radius:8px;padding:8px;margin-bottom:6px}}
+.review-note{{white-space:pre-wrap;font-size:12.5px;line-height:1.55;margin-top:8px;color:#dfe2e8}}
 </style></head><body>
 <header>
-<h1>&#9673; SENTINEL &mdash; God's Eye <span style="color:#555;font-weight:400">/ {SRC}</span></h1>
-<a href="/godseye?source={GODSEYE_SOURCE}">Times Square feed</a>&nbsp;&nbsp;
-<a href="/godseye?source={CAFE_SOURCE}">Cafe feed</a>&nbsp;&nbsp;
-<a href="/dashboard">Attendance dashboard</a>&nbsp;&nbsp;<a href="/logout">Log out</a>
+<h1><span class="glow">&#9673;</span> SENTINEL &mdash; God's Eye <span style="color:#555;font-weight:500;font-size:13px"> / {SRC}</span></h1>
+<nav>
+<a href="/godseye?source={GODSEYE_SOURCE}" class="{'active' if SRC==GODSEYE_SOURCE else ''}">Times Square</a>
+<a href="/godseye?source={CAFE_SOURCE}" class="{'active' if SRC==CAFE_SOURCE else ''}">Cafe</a>
+<a href="/dashboard">Attendance</a>
+<a href="/logout">Log out</a>
+</nav>
 </header>
 <div class="risk-banner">
   <div class="risk-dot low" id="risk-dot"></div>
-  <div><span class="risk-label low" id="risk-label">THEFT RISK: LOW</span><br>
-  <span class="risk-sub" id="risk-sub">no anomalies in the last 5 minutes</span></div>
+  <div><span class="risk-label low" id="risk-label">THEFT RISK: LOW</span>
+  <div class="risk-sub" id="risk-sub">no anomalies in the last 5 minutes</div></div>
+</div>
+<div class="roster-wrap">
+  <div class="roster-title">Team on shift</div>
+  <div class="roster" id="roster"><div class="roster-empty">Loading roster&hellip;</div></div>
 </div>
 <div class="layout">
   <div class="stage-wrap">
@@ -452,7 +536,7 @@ select{{width:100%;background:#1e1e1e;color:#eee;border:1px solid #2c2c2c;border
     <div id="narration-out"></div>
 
     <h2>Ask the agent</h2>
-    <input id="ask-input" placeholder="e.g. who's the most active?" style="width:100%;background:#1e1e1e;color:#eee;border:1px solid #2c2c2c;border-radius:6px;padding:8px;box-sizing:border-box;margin-bottom:6px">
+    <input id="ask-input" placeholder="e.g. who's the most active?">
     <button class="btn" onclick="askAgent()">Ask (Opus 4.8)</button>
     <div id="ask-out"></div>
 
@@ -561,6 +645,29 @@ async function loadThroughput() {{
   box.innerHTML = `<div class="panel"><b>~${{avg}} cups/min</b> <span class="k">(avg, last ${{last.length}} min)</span><br>` +
     last.map(r => `<span class="k">${{r.minute.split('T')[1]}}</span> &mdash; ${{r.count}}`).join('<br>') + `</div>
     <div class="hint">Counts new "cup"-class detections entering frame per minute. Proxy for throughput, not a verified POS count.</div>`;
+}}
+
+async function loadRoster() {{
+  const rows = await (await fetch(`/api/roster/${{SOURCE}}`)).json();
+  const box = document.getElementById('roster');
+  if (!rows.length) {{ box.innerHTML = '<div class="roster-empty">No one enrolled yet.</div>'; return; }}
+  box.innerHTML = rows.map(p => `
+    <div class="emp-card" onclick="selectFromRoster('${{p.name}}')">
+      ${{p.photo_url ? `<img class="emp-photo" src="${{p.photo_url}}">` : `<div class="emp-photo placeholder">${{p.name[0]}}</div>`}}
+      <div class="emp-info">
+        <div class="emp-name"><span class="live-dot ${{p.is_active ? 'on' : ''}}"></span>${{p.name}}</div>
+        <div class="emp-zone">${{p.current_zone}}</div>
+        <div class="emp-meta">${{p.hours_today}}h today &middot; $${{p.estimated_pay}}</div>
+      </div>
+    </div>`).join('');
+}}
+
+function selectFromRoster(name) {{
+  const sel = document.getElementById('identity-select');
+  if ([...sel.options].some(o => o.value === name)) {{
+    sel.value = name;
+    sel.onchange();
+  }}
 }}
 
 async function loadIdentities() {{
@@ -711,12 +818,14 @@ loadIdentities();
 loadThroughput();
 loadCashCollected();
 loadTheftRisk();
+loadRoster();
 setInterval(loadZoneStats, 4000);
 setInterval(loadAlerts, 4000);
 setInterval(loadThroughput, 5000);
 setInterval(loadCashCollected, 5000);
 setInterval(loadTheftRisk, 6000);
 setInterval(loadActivityFeed, 5000);
+setInterval(loadRoster, 6000);
 </script>
 </body></html>
 """

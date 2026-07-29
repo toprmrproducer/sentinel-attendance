@@ -18,6 +18,7 @@ from app import engine as face_engine
 from app import tracking
 from app import telephony
 from app import activity
+from app import attendance
 
 ALERT_CALL_NUMBER = os.environ.get("SENTINEL_ALERT_CALL_NUMBER")  # e.g. "919307512816", unset = disabled
 ALERT_CALL_COOLDOWN_SEC = 120
@@ -74,16 +75,21 @@ def detect_anomalies(frame, source: str):
 
 
 def _identify_person_crop(frame, bbox):
+    """Returns (name, match_score) or (None, None). This is the ONLY place a live
+    frame turns into a recognized identity, so it's also where attendance.log_sighting
+    gets called, that's what feeds the dashboard/payroll/Q&A agent with real data."""
     x1, y1, x2, y2 = bbox
     x1, y1 = max(x1, 0), max(y1, 0)
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
-        return None
+        return None, None
     faces = face_engine.detect_faces(crop)
     if not faces:
-        return None
+        return None, None
     match = face_engine.recognize_face(faces[0].embedding)
-    return match["name"] if match["name"] != "unknown" else None
+    if match["name"] == "unknown":
+        return None, None
+    return match["name"], match["score"]
 
 
 def process_frame(frame, source: str, identify_faces: bool = True):
@@ -107,7 +113,9 @@ def process_frame(frame, source: str, identify_faces: bool = True):
             cls_name = yolo.names[int(cls)]
             identity = None
             if identify_faces and cls_name == "person":
-                identity = _identify_person_crop(frame, bbox)
+                identity, match_score = _identify_person_crop(frame, bbox)
+                if identity:
+                    attendance.log_sighting(identity, match_score, source=source)
 
             tracking.upsert_track(int(tid), source, cls_name, identity, bbox)
 
